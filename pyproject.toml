@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aa-sigcheck-cog"
+version = "0.1.0"
+description = "Alliance Auth Discord cog that reports whether a character meets a Secure Groups group's filter requirements"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "LordStyle" },
+]
+keywords = ["allianceauth", "eve-online", "discord", "aadiscordbot", "corptools", "securegroups"]
+classifiers = [
+    "Environment :: Plugins",
+    "Framework :: Django",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+]
+
+# Intentionally no `dependencies = [...]` here — Alliance Auth, aadiscordbot,
+# allianceauth-corptools and allianceauth-secure-groups must already be installed
+# in the host environment. Declaring them would risk pip resolving conflicting
+# versions on install.
+
+[project.urls]
+Repository = "https://github.com/TheLordStyle/aa-sigcheck-cog"
+Issues = "https://github.com/TheLordStyle/aa-sigcheck-cog/issues"
+
+[tool.setuptools.packages.find]
+include = ["aa_sigcheck*"]
