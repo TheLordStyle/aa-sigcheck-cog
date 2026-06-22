@@ -22,6 +22,7 @@ from asgiref.sync import sync_to_async
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.db import OperationalError, close_old_connections, connections
 
 from allianceauth.authentication.models import CharacterOwnership
 from allianceauth.eveonline.models import EveCharacter
@@ -218,9 +219,39 @@ def _report_embeds(character_name, results, group_name=None):
 
 # ---- Shared command body ----------------------------------------------------
 
+def _with_fresh_db(fn, *args, **kwargs):
+    """Run a sync ORM callable, recovering from stale DB connections.
+
+    The discord bot is a long-lived process, so a Django DB connection can sit
+    idle until MySQL drops it server-side (error 2006, "server has gone away").
+    There's no request/response cycle here to reset connections, so we close
+    any obsolete ones up front and, on a connection error, force every
+    connection closed and retry once against a fresh one. The work is read-only,
+    so the retry is safe.
+    """
+    close_old_connections()
+    try:
+        return fn(*args, **kwargs)
+    except OperationalError:
+        logger.warning("sigcheck: stale DB connection, reconnecting and retrying")
+        for conn in connections.all():
+            conn.close()
+        return fn(*args, **kwargs)
+
+
+def _gather(character: str, group_name: str = None):
+    """Resolve the character and evaluate it in a single DB-bound unit."""
+    ec, user = _resolve_account(character)
+    if ec is None or user is None:
+        return ec, user, []
+    return ec, user, _evaluate(user, group_name)
+
+
 async def _run(character: str, group_name: str = None):
     """Resolve + evaluate. Returns (embeds, error_message)."""
-    ec, user = await sync_to_async(_resolve_account)(character)
+    ec, user, results = await sync_to_async(_with_fresh_db)(
+        _gather, character, group_name
+    )
     if ec is None:
         return None, (
             f"`{character}` isn't a character known to Alliance Auth "
@@ -231,7 +262,6 @@ async def _run(character: str, group_name: str = None):
             f"`{ec.character_name}` is known to Alliance Auth but isn't linked "
             "to any account, so its group eligibility can't be evaluated."
         )
-    results = await sync_to_async(_evaluate)(user, group_name)
     return _report_embeds(ec.character_name, results, group_name), None
 
 

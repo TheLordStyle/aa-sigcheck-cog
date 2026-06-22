@@ -55,7 +55,7 @@ dependencies of its own so it can't drag in conflicting versions.
 Add it to your Alliance Auth `requirements.txt` (pin to a released tag):
 
 ```
-git+https://github.com/TheLordStyle/aa-sigcheck-cog.git@v0.1.0
+git+https://github.com/TheLordStyle/aa-sigcheck-cog.git@v0.1.1
 ```
 
 Then in your `local.py`:
