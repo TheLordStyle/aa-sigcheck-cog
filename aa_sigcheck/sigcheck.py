@@ -474,10 +474,46 @@ def _audit_blocks(result):
     return blocks
 
 
-async def _run_audit(group_name: str):
-    """Run a group audit. Returns (embeds, error_message)."""
+def _auditable_groups():
+    """Names of Secure Groups that `sigaudit` can audit.
+
+    A group is auditable when it has at least one positive (non-reversed)
+    `UserInGroupFilter` — the "requires membership of another group" rule that
+    bounds the audit population.
+    """
+    names = []
+    for sg in (
+        SmartGroup.objects.select_related("group").prefetch_related("filters")
+    ):
+        for sf in sg.filters.all():
+            fo = sf.filter_object
+            if isinstance(fo, UserInGroupFilter) and not fo.reversed_logic:
+                names.append(sg.group.name)
+                break
+    return sorted(names, key=str.lower)
+
+
+def _audit_list_embeds(names):
+    """Embeds listing the groups sigaudit can check."""
+    intro = (
+        "**SigAudit** — audit a Secure Group that requires membership of "
+        "another group.\nUsage: `!sigaudit <group>` or `/sigaudit group:<group>`."
+        f"\n\n__**Auditable groups ({len(names)})**__"
+    )
+    blocks = _chunk_section(intro, [f"• {n}" for n in names])
+    return _build_embeds(blocks, "SigAudit — available groups")
+
+
+async def _run_audit(group_name: str = None):
+    """Run a group audit, or list auditable groups. Returns (embeds, error)."""
     if not group_name or not group_name.strip():
-        return None, "Usage: provide a Secure Group name to audit."
+        names = await sync_to_async(_with_fresh_db)(_auditable_groups)
+        if not names:
+            return None, (
+                "No Secure Groups can be audited — none require membership of "
+                "another group (a non-reversed 'User in Group' filter)."
+            )
+        return _audit_list_embeds(names), None
 
     result = await sync_to_async(_with_fresh_db)(_audit_group, group_name)
     status = result["status"]
@@ -583,18 +619,14 @@ class SigCheck(commands.Cog):
 
     @commands.command(pass_context=True)
     async def sigaudit(self, ctx, *, group: str = None):
-        """!sigaudit <Secure Group name>
+        """!sigaudit [Secure Group name]
 
         Audit a Secure Group that requires membership of another group: list who
         passes all its filters and, for those who don't, which filters failed and
-        their last EVE login.
+        their last EVE login. With no group name, lists the auditable groups.
         """
         if not _channel_access(ctx.message.channel.id, ctx.author.id):
             return await ctx.message.add_reaction(chr(0x1F44E))  # 👎
-        if not group:
-            return await ctx.message.reply(
-                "Usage: `!sigaudit <Secure Group name>`"
-            )
 
         embeds, err = await _run_audit(group)
         if err:
@@ -605,10 +637,10 @@ class SigCheck(commands.Cog):
     @commands.slash_command(name="sigaudit", guild_ids=get_all_servers())
     @option(
         "group",
-        description="Secure Group to audit (must require another group)",
-        required=True,
+        description="Secure Group to audit (leave blank to list auditable groups)",
+        required=False,
     )
-    async def slash_sigaudit(self, ctx, group: str):
+    async def slash_sigaudit(self, ctx, group: str = None):
         try:
             await self._audit_impl(ctx, group)
         except Exception as e:

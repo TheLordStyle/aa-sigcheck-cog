@@ -131,12 +131,16 @@ Both prefix and slash forms are available.
 ```
 !sigaudit Capital Pilots
 /sigaudit group: Capital Pilots
+!sigaudit                  (no group → lists the groups it can audit)
+/sigaudit
 ```
 
 - Lists passing accounts, then failing accounts with their failed filters and
   last EVE login.
 - Only valid for a Secure Group that requires another group (a *User in Group*
   filter); otherwise the command explains why it can't audit it.
+- Run it with **no group** to list every Secure Group that's auditable (i.e. has
+  such a requirement).
 
 ## How it works
 

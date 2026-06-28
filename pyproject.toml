@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aa-sigcheck-cog"
-version = "0.2.0"
+version = "0.3.0"
 description = "Alliance Auth Discord cog that reports whether a character meets a Secure Groups group's filter requirements"
 readme = "README.md"
 requires-python = ">=3.10"
