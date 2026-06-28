@@ -1,16 +1,26 @@
-"""SigCheck: report whether a character meets a Secure Groups group's filters.
+"""SigCheck: report whether characters meet Secure Groups filter requirements.
 
-For a given character name this resolves the owning Alliance Auth account and,
-for each Secure Group (`securegroups.models.SmartGroup`), reports which of the
-group's smart filters the account meets (✅) and which it does not (❌), plus an
-overall qualify / doesn't-qualify verdict. A Secure Group only grants membership
-when *every* one of its filters passes, so the verdict is the AND of all filters.
+Two commands:
+
+* ``sigcheck <character>`` — resolve the owning Alliance Auth account and, for
+  each Secure Group (``securegroups.models.SmartGroup``), report which of the
+  group's smart filters the account meets (✅) and which it does not (❌), plus an
+  overall qualify / doesn't-qualify verdict. A Secure Group only grants
+  membership when *every* one of its filters passes, so the verdict is the AND
+  of all filters.
+
+* ``sigaudit <group>`` — audit one Secure Group across a population: who passes
+  every filter and who doesn't, with the failing filters and last EVE login for
+  those who don't. Restricted to Secure Groups that require membership of
+  another group (a non-reversed ``UserInGroupFilter``); that prerequisite group
+  bounds the population that gets checked.
 
 Secure Groups operates at the account level (all of a user's characters are
-considered by the individual filters), so the result is the same regardless of
-which of a user's characters is named.
+considered by the individual filters), so a character check is really an account
+check.
 """
 import logging
+from datetime import timezone as dt_timezone
 
 import discord
 from aadiscordbot.app_settings import get_all_servers
@@ -21,13 +31,17 @@ from discord.ext import commands
 from asgiref.sync import sync_to_async
 
 from django.conf import settings
+from django.contrib.auth.models import Group, User
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import OperationalError, close_old_connections, connections
+from django.db.models import Max
+from django.utils import timezone
 
 from allianceauth.authentication.models import CharacterOwnership
 from allianceauth.eveonline.models import EveCharacter
 
-from securegroups.models import SmartGroup
+from corptools.models import CharacterAudit
+from securegroups.models import SmartGroup, UserInGroupFilter
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +279,225 @@ async def _run(character: str, group_name: str = None):
     return _report_embeds(ec.character_name, results, group_name), None
 
 
+# ---- Group audit (sigaudit) -------------------------------------------------
+#
+# Audit one Secure Group: who currently passes all its filters and who doesn't,
+# with the failing filters and last EVE login for those who don't. Restricted to
+# Secure Groups that require membership of another group (a non-reversed
+# `UserInGroupFilter`); that prerequisite group bounds the population we check.
+
+def _main_name(user):
+    """Best display name for an account: main character, else username."""
+    try:
+        mc = user.profile.main_character
+        if mc is not None:
+            return mc.character_name
+    except (ObjectDoesNotExist, AttributeError):
+        pass
+    return user.username
+
+
+def _group_names(group_ids):
+    return list(
+        Group.objects.filter(id__in=list(group_ids))
+        .values_list("name", flat=True)
+    )
+
+
+def _required_population(required_group_ids):
+    """Accounts in any of the prerequisite groups — the audit population."""
+    return list(
+        User.objects
+        .filter(groups__id__in=list(required_group_ids))
+        .distinct()
+        .select_related("profile__main_character")
+    )
+
+
+def _last_logins(user_ids):
+    """Map user_id -> most recent last_known_login across all their characters."""
+    rows = (
+        CharacterAudit.objects
+        .filter(character__character_ownership__user_id__in=user_ids)
+        .values("character__character_ownership__user_id")
+        .annotate(last=Max("last_known_login"))
+    )
+    return {
+        r["character__character_ownership__user_id"]: r["last"] for r in rows
+    }
+
+
+def _fmt_login(dt):
+    if dt is None:
+        return "no recorded login"
+    if timezone.is_naive(dt):
+        dt = dt.replace(tzinfo=dt_timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _bulk_checks(filters, population_qs):
+    """Pre-compute each filter's audit over the whole population.
+
+    Returns {smartfilter_id: <audit_filter result>}. Mirrors how Secure Groups
+    itself bulk-audits — far cheaper than calling process_filter per user. A
+    filter that errors gets an empty map and falls back to process_filter below.
+    """
+    bulk = {}
+    for sf, fo in filters:
+        if fo is None:
+            continue
+        try:
+            bulk[sf.id] = fo.audit_filter(population_qs)
+        except Exception:
+            logger.exception("audit_filter failed for filter %r", fo)
+            bulk[sf.id] = {}
+    return bulk
+
+
+def _user_filter_result(sf, fo, user, bulk):
+    """(passed, message) for one user/filter, preferring the bulk audit result.
+
+    Falls back to process_filter(user) when the bulk map has no entry for this
+    user — the same fallback Secure Groups uses in process_user().
+    """
+    try:
+        entry = bulk[sf.id][user.id]
+        return bool(entry["check"]), entry.get("message", "") or ""
+    except Exception:
+        try:
+            return bool(fo.process_filter(user)), ""
+        except Exception:
+            logger.exception(
+                "process_filter failed for filter %r on user %s", fo, user
+            )
+            return False, ""
+
+
+def _audit_group(group_name: str):
+    """Audit a Secure Group. Returns a status dict consumed by _run_audit."""
+    sg = (
+        SmartGroup.objects
+        .select_related("group")
+        .prefetch_related("filters")
+        .filter(group__name__iexact=group_name.strip())
+        .first()
+    )
+    if sg is None:
+        return {"status": "no_group"}
+
+    filters = []
+    required_group_ids = set()
+    for sf in sg.filters.all():
+        fo = sf.filter_object
+        filters.append((sf, fo))
+        # The "requirement of being in another group": a positive (non-reversed)
+        # UserInGroupFilter. Its groups define who we audit.
+        if isinstance(fo, UserInGroupFilter) and not fo.reversed_logic:
+            required_group_ids.update(
+                fo.groups.all().values_list("id", flat=True)
+            )
+
+    if not required_group_ids:
+        return {"status": "no_group_requirement", "group": sg.group.name}
+
+    population = _required_population(required_group_ids)
+    if not population:
+        return {
+            "status": "empty",
+            "group": sg.group.name,
+            "required_groups": _group_names(required_group_ids),
+        }
+
+    user_ids = [u.pk for u in population]
+    population_qs = User.objects.filter(pk__in=user_ids)
+    bulk = _bulk_checks(filters, population_qs)
+    last_login = _last_logins(user_ids)
+
+    passers, failers = [], []
+    for user in population:
+        failed = []
+        for sf, fo in filters:
+            if fo is None:
+                failed.append("(unavailable filter)")
+                continue
+            ok, message = _user_filter_result(sf, fo, user, bulk)
+            if not ok:
+                desc = getattr(fo, "description", str(fo))
+                failed.append(f"{desc} — {message}" if message else desc)
+        name = _main_name(user)
+        if failed:
+            failers.append({
+                "name": name,
+                "failed": failed,
+                "last_login": last_login.get(user.pk),
+            })
+        else:
+            passers.append(name)
+
+    return {
+        "status": "ok",
+        "group": sg.group.name,
+        "required_groups": _group_names(required_group_ids),
+        "population": len(population),
+        "passers": sorted(passers, key=str.lower),
+        "failers": sorted(failers, key=lambda f: str(f["name"]).lower()),
+    }
+
+
+def _audit_blocks(result):
+    req = ", ".join(result["required_groups"]) or "the required group(s)"
+    passers = result["passers"]
+    failers = result["failers"]
+
+    blocks = [
+        f"__**{result['group']}** — group audit__\n"
+        f"Population: {result['population']} account(s) in {req}\n"
+        f"🟩 Pass: {len(passers)}    🟥 Fail: {len(failers)}"
+    ]
+
+    if passers:
+        blocks.extend(_chunk_section(
+            f"**🟩 Passing ({len(passers)})**",
+            [f"• {n}" for n in passers],
+        ))
+    if failers:
+        lines = []
+        for f in failers:
+            reasons = "; ".join(f["failed"])
+            lines.append(
+                f"• **{f['name']}** — last login {_fmt_login(f['last_login'])}\n"
+                f" ❌ {reasons}"
+            )
+        blocks.extend(_chunk_section(
+            f"**🟥 Failing ({len(failers)})**", lines,
+        ))
+    return blocks
+
+
+async def _run_audit(group_name: str):
+    """Run a group audit. Returns (embeds, error_message)."""
+    if not group_name or not group_name.strip():
+        return None, "Usage: provide a Secure Group name to audit."
+
+    result = await sync_to_async(_with_fresh_db)(_audit_group, group_name)
+    status = result["status"]
+    if status == "no_group":
+        return None, f"No Secure Group named `{group_name}` was found."
+    if status == "no_group_requirement":
+        return None, (
+            f"`{result['group']}` can't be audited this way. This command only "
+            "works for Secure Groups that require membership of another group "
+            "(a non-reversed 'User in Group' filter); this group has no such "
+            "requirement."
+        )
+    if status == "empty":
+        req = ", ".join(result["required_groups"]) or "the required group(s)"
+        return None, f"No accounts are in {req}, so there's nothing to audit."
+
+    embeds = _build_embeds(_audit_blocks(result), f"SigAudit: {result['group']}")
+    return embeds, None
+
+
 # ---- The cog ----------------------------------------------------------------
 
 class SigCheck(commands.Cog):
@@ -340,6 +573,67 @@ class SigCheck(commands.Cog):
 
         await ctx.defer()
         embeds, err = await _run(character, group)
+        if err:
+            return await ctx.respond(err, ephemeral=True)
+        await ctx.respond(embed=embeds[0])
+        for e in embeds[1:]:
+            await ctx.followup.send(embed=e)
+
+    # ---- sigaudit: audit a whole group --------------------------------
+
+    @commands.command(pass_context=True)
+    async def sigaudit(self, ctx, *, group: str = None):
+        """!sigaudit <Secure Group name>
+
+        Audit a Secure Group that requires membership of another group: list who
+        passes all its filters and, for those who don't, which filters failed and
+        their last EVE login.
+        """
+        if not _channel_access(ctx.message.channel.id, ctx.author.id):
+            return await ctx.message.add_reaction(chr(0x1F44E))  # 👎
+        if not group:
+            return await ctx.message.reply(
+                "Usage: `!sigaudit <Secure Group name>`"
+            )
+
+        embeds, err = await _run_audit(group)
+        if err:
+            return await ctx.message.reply(err)
+        for e in embeds:
+            await ctx.message.reply(embed=e)
+
+    @commands.slash_command(name="sigaudit", guild_ids=get_all_servers())
+    @option(
+        "group",
+        description="Secure Group to audit (must require another group)",
+        required=True,
+    )
+    async def slash_sigaudit(self, ctx, group: str):
+        try:
+            await self._audit_impl(ctx, group)
+        except Exception as e:
+            logger.exception("sigaudit slash command failed")
+            msg = (
+                f"⚠️ SigAudit hit `{type(e).__name__}`. Ask an admin to check "
+                "the discordbot log for the traceback."
+            )
+            try:
+                if ctx.response.is_done():
+                    await ctx.followup.send(msg, ephemeral=True)
+                else:
+                    await ctx.respond(msg, ephemeral=True)
+            except Exception:
+                logger.exception("sigaudit error reply also failed")
+
+    async def _audit_impl(self, ctx, group):
+        if not _channel_access(ctx.channel.id, ctx.user.id):
+            return await ctx.respond(
+                "This command isn't available to you in this channel.",
+                ephemeral=True,
+            )
+
+        await ctx.defer()
+        embeds, err = await _run_audit(group)
         if err:
             return await ctx.respond(err, ephemeral=True)
         await ctx.respond(embed=embeds[0])

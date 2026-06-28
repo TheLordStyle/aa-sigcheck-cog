@@ -13,6 +13,10 @@ character does or doesn't qualify — without waiting for the next cron run.
 
 ## What it does
 
+The cog provides two commands.
+
+### `sigcheck` — check one character
+
 Given a character name, the cog:
 
 1. Resolves the character to its owning Alliance Auth account.
@@ -29,6 +33,23 @@ the result is the same whichever of a user's characters you name.
 The report also flags a mismatch between the live verdict and current
 membership — e.g. *"Currently a member but no longer qualifies — would be
 removed"* — so you can see what the next Secure Groups run will do.
+
+### `sigaudit` — audit a whole group
+
+Given a Secure Group name, the cog lists **who passes** every filter and **who
+doesn't** — and for each failing account, **which filters failed** and their
+**last EVE login** (the most recent login across all of that account's
+characters, from corptools).
+
+This only works for Secure Groups that **require membership of another group**
+(i.e. the group has a non-reversed *User in Group* filter). That prerequisite
+group defines the population to audit: every account in the required group is
+checked against the Secure Group's full filter set. Groups without such a
+requirement are rejected, since there'd be no bounded population to walk.
+
+The failure reasons come from each filter's own audit output, the same data
+Secure Groups uses when it decides membership, so the audit matches what the
+cron run would do.
 
 ## Access control
 
@@ -90,7 +111,9 @@ Restart the discord bot after editing settings.
 
 ## Usage
 
-Both prefix and slash forms are available:
+Both prefix and slash forms are available.
+
+**Check one character:**
 
 ```
 !sigcheck Some Pilot
@@ -103,13 +126,35 @@ Both prefix and slash forms are available:
 - With a group, only that group's filter breakdown is shown (and a clean pass
   colours the embed green).
 
+**Audit a whole group:**
+
+```
+!sigaudit Capital Pilots
+/sigaudit group: Capital Pilots
+```
+
+- Lists passing accounts, then failing accounts with their failed filters and
+  last EVE login.
+- Only valid for a Secure Group that requires another group (a *User in Group*
+  filter); otherwise the command explains why it can't audit it.
+
 ## How it works
 
-For each `securegroups.models.SmartGroup` the cog reads the group's
-`SmartFilter` set and calls each filter object's `process_filter(user)` — the
-same call Secure Groups uses to decide membership — then aggregates the results.
-Evaluation runs off the event loop (`sync_to_async`) after the interaction is
-deferred, since filters can touch skills/assets data.
+`sigcheck` reads each `securegroups.models.SmartGroup`'s `SmartFilter` set and
+calls each filter object's `process_filter(user)` — the same call Secure Groups
+uses to decide membership — then aggregates the results.
+
+`sigaudit` finds the group's non-reversed `UserInGroupFilter`, takes the members
+of the required group as the population, and runs every filter's
+`audit_filter(users)` over that population in bulk (falling back to
+`process_filter` per user where a filter returns no bulk entry) — again matching
+how Secure Groups itself evaluates membership. Last login comes from
+`corptools.models.CharacterAudit.last_known_login`, taking the most recent value
+across the account's characters.
+
+Both run off the event loop (`sync_to_async`) after the interaction is deferred,
+since filters can touch skills/assets data. Connections are refreshed each run
+to survive the bot's long idle periods (MySQL "server has gone away").
 
 ## Caveats
 
@@ -120,6 +165,11 @@ deferred, since filters can touch skills/assets data.
   evaluated (there's no account to check); the cog says so explicitly.
 - A Secure Group with no filters configured is reported as not-qualifying, since
   there's no automatic criterion to satisfy.
+- `sigaudit` walks every account in the required group, so for a large
+  prerequisite group it does more work — the bot defers the interaction and
+  paginates the reply, but expect a short wait on big groups.
+- "Last login" is `null` for characters corptools has never updated; those show
+  as *no recorded login*.
 
 ## License
 
